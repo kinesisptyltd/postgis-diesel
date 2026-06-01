@@ -1,0 +1,65 @@
+#!/bin/sh -eu
+#
+# bin/setup - bootstrap postgis-diesel for development from a fresh clone.
+#
+# Idempotent: safe to run repeatedly. Gets the project to a state where
+# `cargo build` and `cargo test` succeed.
+#
+# What it does:
+#   1. Ensures a .env with DATABASE_URL exists.
+#   2. Starts the PostGIS database container (docker compose).
+#   3. Waits for the database to accept connections.
+#   4. Fetches dependencies and builds the project.
+#
+# This crate has no diesel migrations (no diesel.toml / migrations/); the
+# integration test creates the postgis extension and its own table at runtime.
+# So there is no db-create/db-migrate step here -- the database only needs to
+# be up and reachable.
+
+cd "$(dirname "$0")/.."
+
+# Default connection string, kept in sync with docker-compose.yml (port 5433).
+DEFAULT_DATABASE_URL="postgres://postgres:postgres@localhost:5433/postgres"
+
+# 1. Ensure .env exists. It is tracked in git, but recreate it defensively so a
+#    partial checkout still works.
+if [ ! -f .env ]; then
+  echo "Creating .env with default DATABASE_URL"
+  echo "DATABASE_URL=${DEFAULT_DATABASE_URL}" > .env
+else
+  echo ".env already present"
+fi
+
+# Resolve the compose command (plugin form preferred, legacy fallback).
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE="docker compose"
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE="docker-compose"
+else
+  echo "error: docker compose is required but was not found" >&2
+  exit 1
+fi
+
+# 2. Start the database. `up -d` is idempotent: a no-op if already running.
+echo "Starting database container..."
+$COMPOSE up -d
+
+# 3. Wait for postgres to be ready to accept connections.
+echo "Waiting for database to accept connections..."
+i=0
+until $COMPOSE exec -T db pg_isready -U postgres >/dev/null 2>&1; do
+  i=$((i + 1))
+  if [ "$i" -ge 60 ]; then
+    echo "error: database did not become ready in time" >&2
+    exit 1
+  fi
+  sleep 1
+done
+echo "Database is ready."
+
+# 4. Fetch dependencies and build (also compiles dev-dependencies via tests).
+echo "Fetching dependencies and building..."
+cargo build
+cargo test --no-run
+
+echo "Setup complete. Run 'cargo test' to run the test suite."
